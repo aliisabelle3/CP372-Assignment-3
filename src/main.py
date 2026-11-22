@@ -1,142 +1,213 @@
 """
 CP372 Assignment 3 - Network Routing and Packet Forwarding Simulation
-Main Execution Script
+Includes Bonus Mark Task for 10%: UDP Socket-Based Link-State Advertisements & Packet Forwarding
 """
 
-import os
+import socket
+import threading
+import time
+import json
 
-class NetworkSimulator:
-    def __init__(self, topology_file):
-        self.topology_file = topology_file
-        self.nodes = set()
-        self.adjacency_list = {}
-        self.routing_tables = {}
+# Network topology configuration
+TOPOLOGY_DATA = """
+A B 1
+A C 4
+B C 2
+B D 5
+C D 1
+"""
 
-    def load_topology(self):
-        """Loads and parses the network topology file from inputs/"""
-        if not os.path.exists(self.topology_file):
-            print(f"Error: Topology file '{self.topology_file}' not found.")
-            return False
+# Dedicated UDP port assignments per router (127.0.0.1)
+ROUTER_PORTS = {
+    "A": 5001,
+    "B": 5002,
+    "C": 5003,
+    "D": 5004
+}
 
-        print(f"Loading topology from {self.topology_file}...")
-        with open(self.topology_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.split()
-                if len(parts) == 3:
-                    u, v, cost = parts[0], parts[1], int(parts[2])
-                    self.nodes.add(u)
-                    self.nodes.add(v)
-                    
-                    if u not in self.adjacency_list:
-                        self.adjacency_list[u] = {}
-                    if v not in self.adjacency_list:
-                        self.adjacency_list[v] = {}
-                        
-                    self.adjacency_list[u][v] = cost
-                    self.adjacency_list[v][u] = cost # Assuming undirected weighted links
-        
-        print(f"Discovered nodes: {sorted(list(self.nodes))}")
-        return True
 
-    def compute_shortest_paths(self, start_node):
-        """Computes shortest paths using Dijkstra's algorithm for a given router"""
-        distances = {node: float('inf') for node in self.nodes}
-        next_hops = {node: None for node in self.nodes}
-        distances[start_node] = 0
-        unvisited = set(self.nodes)
+class SocketRouterNode:
+    """Represents an independent router listening on its own UDP port."""
+    def __init__(self, name, port, all_ports, neighbors):
+        self.name = name
+        self.port = port
+        self.all_ports = all_ports
+        self.neighbors = neighbors  # {neighbor_name: cost}
+        self.lsdb = {name: dict(neighbors)}  # Link-State Database
+        self.routing_table = {}
+        self.running = True
+        self.received_packets = []
+
+        # Bind UDP socket to dedicated port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", self.port))
+        self.sock.settimeout(0.2)
+
+        self.listener_thread = threading.Thread(target=self._listen, daemon=True)
+        self.listener_thread.start()
+
+    def _listen(self):
+        """Background thread listening for incoming LSA and DATA UDP packets."""
+        while self.running:
+            try:
+                raw_data, _ = self.sock.recvfrom(4096)
+                msg = json.loads(raw_data.decode("utf-8"))
+                msg_type = msg.get("type")
+
+                if msg_type == "LSA":
+                    origin = msg["origin"]
+                    links = msg["links"]
+                    self.lsdb[origin] = links
+
+                elif msg_type == "DATA":
+                    dest = msg["dest"]
+                    payload = msg["payload"]
+                    path = msg["path"] + [self.name]
+
+                    if dest == self.name:
+                        print(f"[UDP Port {self.port} | Router {self.name}] Packet DELIVERED! Payload: '{payload}'")
+                        print(f"    -> Verified UDP Socket Path: {' -> '.join(path)}")
+                        self.received_packets.append(msg)
+                    else:
+                        self.forward_data_packet(dest, payload, path)
+
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+    def advertise_link_state(self):
+        """BONUS REQUIREMENT: Advertise link costs one-by-one via UDP to all other routers."""
+        lsa_packet = json.dumps({
+            "type": "LSA",
+            "origin": self.name,
+            "links": self.neighbors
+        }).encode("utf-8")
+
+        for target_router, target_port in self.all_ports.items():
+            if target_router != self.name:
+                print(f"[UDP Port {self.port} | Router {self.name}] Sending LSA unicast to Router {target_router} (Port {target_port})")
+                self.sock.sendto(lsa_packet, ("127.0.0.1", target_port))
+
+    def compute_dijkstra(self):
+        """Computes shortest paths from local Link-State Database (LSDB)."""
+        all_nodes = set(self.lsdb.keys())
+        for links in self.lsdb.values():
+            all_nodes.update(links.keys())
+
+        distances = {node: float("inf") for node in all_nodes}
+        next_hops = {node: None for node in all_nodes}
+        distances[self.name] = 0
+        unvisited = set(all_nodes)
 
         while unvisited:
-            current_node = min(unvisited, key=lambda node: distances[node])
-            if distances[current_node] == float('inf'):
+            current = min(unvisited, key=lambda n: distances[n])
+            if distances[current] == float("inf"):
                 break
-            unvisited.remove(current_node)
+            unvisited.remove(current)
 
-            for neighbor, weight in self.adjacency_list.get(current_node, {}).items():
+            for neighbor, cost in self.lsdb.get(current, {}).items():
                 if neighbor in unvisited:
-                    new_distance = distances[current_node] + weight
-                    if new_distance < distances[neighbor]:
-                        distances[neighbor] = new_distance
-                        # Determine the first hop from start_node to neighbor
-                        if current_node == start_node:
-                            next_hops[neighbor] = neighbor
-                        else:
-                            # Trace back or inherit next hop
-                            next_hops[neighbor] = next_hops[current_node]
+                    new_dist = distances[current] + cost
+                    if new_dist < distances[neighbor]:
+                        distances[neighbor] = new_dist
+                        next_hops[neighbor] = neighbor if current == self.name else next_hops[current]
 
-        # Populate routing table format: {destination: {'next_hop': next_hop, 'cost': cost}}
-        table = {}
-        for node in self.nodes:
-            if node != start_node:
-                table[node] = {
-                    "next_hop": next_hops[node],
-                    "cost": distances[node]
-                }
-        self.routing_tables[start_node] = table
+        self.routing_table = {
+            node: {"next_hop": next_hops[node], "cost": distances[node]}
+            for node in all_nodes if node != self.name
+        }
 
-    def build_all_routing_tables(self):
-        """Computes routing tables for all nodes in the network"""
-        for node in self.nodes:
-            self.compute_shortest_paths(node)
-        print("Routing tables successfully computed for all routers.")
+    def forward_data_packet(self, dest, payload, path=None):
+        """BONUS REQUIREMENT: Transmit packet along path using UDP sockets."""
+        if path is None:
+            path = [self.name]
 
-    def print_routing_tables(self):
-        """Prints out routing tables for verification"""
-        print("\n--- Computed Routing Tables ---")
-        for router, table in self.routing_tables.itemsheta if hasattr(self, 'routing_tables') else self.routing_tables.items():
-            pass # Handled below cleanly
-        for router, table in self.routing_tables.items():
-            print(f"Router {router} Routing Table:")
-            print(f"{'Destination':<12} | {'Next Hop':<10} | {'Cost':<5}")
-            print("-" * 35)
-            for dest, info in table.items():
-                print(f"{dest:<12} | {str(info['next_hop']):<10} | {info['cost']:<5}")
-            print()
-
-    def simulate_packet_forwarding(self, source, dest, payload):
-        """Simulates hop-by-hop packet forwarding across the network graph"""
-        print(f"\n--- Simulating Packet Transmission: {source} -> {dest} ---")
-        current_node = source
-        path = [current_node]
-
-        if source not in self.nodes or dest not in self.nodes:
-            print(f"Error: Source or Destination node not found in network topology.")
+        route = self.routing_table.get(dest)
+        if not route or not route["next_hop"]:
+            print(f"[UDP Port {self.port} | Router {self.name}] No route to {dest}. Dropping packet.")
             return
 
-        while current_node != dest:
-            table = self.routing_tables.get(current_node, {})
-            if dest not in table or table[dest]['next_hop'] is None:
-                print(f"Router {current_node}: No route found to {dest}. Packet dropped.")
-                return
-            
-            next_hop = table[dest]['next_hop']
-            print(f"Router {current_node}: Forwarding packet to {{Payload: '{payload}'}} -> Next Hop: {next_hop}")
-            current_node = next_hop
-            path.append(current_node)
+        next_hop = route["next_hop"]
+        next_port = self.all_ports[next_hop]
+        print(f"[UDP Port {self.port} | Router {self.name}] Forwarding UDP packet to {dest} via Next Hop {next_hop} (Port {next_port})")
 
-        print(f"Packet successfully delivered to destination {dest}!")
-        print(f"Complete Forwarding Path: {' -> '.join(path)}")
+        packet = json.dumps({
+            "type": "DATA",
+            "dest": dest,
+            "payload": payload,
+            "path": path
+        }).encode("utf-8")
+        self.sock.sendto(packet, ("127.0.0.1", next_port))
+
+    def shutdown(self):
+        self.running = False
+        self.sock.close()
 
 
-def run_main():
-    print("=== CP372 Assignment 3: Network Routing Simulation ===")
-    
-    # Path to topology input file
-    topology_path = os.path.join("inputs", "topology_sample.txt")
-    
-    simulator = NetworkSimulator(topology_path)
-    
-    if simulator.load_topology():
-        simulator.build_all_routing_tables()
-        simulator.print_routing_tables()
-        
-        # Run test packet transmissions
-        simulator.simulate_packet_forwarding("A", "D", "Test Packet 1: Hello Computer Networks")
-        simulator.simulate_packet_forwarding("C", "A", "Test Packet 2: Return Acknowledgement")
-        
-    print("\n=== Simulation Completed Successfully ===")
+def parse_topology(text_data):
+    graph = {}
+    for line in text_data.strip().split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) == 3:
+            u, v, cost = parts[0], parts[1], int(parts[2])
+            graph.setdefault(u, {})[v] = cost
+            graph.setdefault(v, {})[u] = cost
+    return graph
+
+
+def run_socket_simulation():
+    print("=== CP372 Assignment 3: UDP Socket-Based Routing Simulation (Bonus) ===")
+    graph = parse_topology(TOPOLOGY_DATA)
+    routers = {}
+
+    try:
+        # 1. Initialize each router on its own dedicated UDP port
+        for node in sorted(graph.keys()):
+            port = ROUTER_PORTS[node]
+            routers[node] = SocketRouterNode(node, port, ROUTER_PORTS, graph[node])
+            print(f"Initialized Router {node} listening on 127.0.0.1:{port}")
+
+        time.sleep(0.3)
+
+        # 2. Link-State Advertisement phase (one-by-one unicast over UDP)
+        print("\n--- Phase 1: Unicast Link-State Advertisements (LSA) over UDP ---")
+        for node in sorted(routers.keys()):
+            routers[node].advertise_link_state()
+            time.sleep(0.1)
+
+        time.sleep(0.4)
+
+        # 3. Compute routing tables using Dijkstra's Algorithm
+        print("\n--- Phase 2: Computing Shortest-Path Routing Tables ---")
+        for node in sorted(routers.keys()):
+            routers[node].compute_dijkstra()
+            print(f"\nRouter {node} (Port {ROUTER_PORTS[node]}) Routing Table:")
+            print(f"{'Destination':<12} | {'Next Hop':<10} | {'Cost':<5}")
+            print("-" * 35)
+            for dest, info in sorted(routers[node].routing_table.items()):
+                print(f"{dest:<12} | {str(info['next_hop']):<10} | {info['cost']:<5}")
+
+        # 4. Transmit data packets hop-by-hop over UDP sockets
+        print("\n--- Phase 3: Hop-by-Hop Packet Forwarding over UDP Sockets ---")
+        print("\n[Transmission 1: Router A -> Router D]")
+        routers["A"].forward_data_packet("D", "Hello CP372 via UDP Sockets!")
+        time.sleep(0.5)
+
+        print("\n[Transmission 2: Router C -> Router A]")
+        routers["C"].forward_data_packet("A", "ACK Received via UDP Sockets!")
+        time.sleep(0.5)
+
+    finally:
+        for router in routers.values():
+            router.shutdown()
+
+    print("\n=== UDP Socket Simulation Completed Successfully ===")
+
 
 if __name__ == "__main__":
-    run_main()
+    run_socket_simulation()
