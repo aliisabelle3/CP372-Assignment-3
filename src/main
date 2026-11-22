@@ -1,0 +1,42 @@
+"""
+Network Routing and Packet Forwarding Simulation
+Main Execution Script
+"""
+
+class Router:
+    def __init__(self, name):
+        self.name = name
+        self.routing_table = {}
+
+    def update_routing_table(self, destination, next_hop, cost):
+        self.routing_table[destination] = {"next_hop": next_hop, "cost": cost}
+
+    def forward_packet(self, packet):
+        destination = packet.get("dest")
+        if destination in self.routing_table:
+            next_hop = self.routing_table[destination]["next_hop"]
+            print(f"Router {self.name}: Forwarding packet to {destination} via next hop {next_hop}")
+            return next_hop
+        else:
+            print(f"Router {self.name}: Route to {destination} not found. Dropping packet.")
+            return None
+
+
+def run_simulation():
+    print("--- Starting Network Routing Simulation ---")
+    
+    # Initialize routers
+    router_a = Router("A")
+    router_b = Router("B")
+    
+    # Setup simple routing table entry
+    router_a.update_routing_table("B", "B", 1)
+    
+    # Simulate packet forwarding
+    sample_packet = {"source": "A", "dest": "B", "data": "Hello Network"}
+    router_a.forward_packet(sample_packet)
+    
+    print("--- Simulation Completed Successfully ---")
+
+if __name__ == "__main__":
+    run_simulation()
