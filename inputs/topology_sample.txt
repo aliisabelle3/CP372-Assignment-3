@@ -1,0 +1,7 @@
+# Network Topology Configuration Sample
+# Format: [Source_Router] [Destination_Router] [Link_Cost]
+A B 1
+A C 4
+B C 2
+B D 5
+C D 1
